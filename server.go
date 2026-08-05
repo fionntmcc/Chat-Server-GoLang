@@ -13,7 +13,7 @@ type Server struct {
 	listener  net.Listener
 	clients   map[net.Conn]string // connection -> username
 	mu        sync.RWMutex
-	broadcast chan Message
+	broadcast chan []byte
 	quit      chan bool
 }
 
@@ -27,7 +27,7 @@ func NewServer(address string) (*Server, error) {
 	return &Server{
 		listener:  listener,
 		clients:   make(map[net.Conn]string),
-		broadcast: make(chan Message),
+		broadcast: make(chan []byte),
 		quit:      make(chan bool),
 	}, nil
 }
@@ -96,12 +96,12 @@ func (s *Server) handleConn(conn net.Conn) {
 		s.mu.Lock()
 		delete(s.clients, conn)
 		s.mu.Unlock()
-		s.broadcast <- Message{sender: username, text: "has left", sentAt: time.Now()}
+		s.broadcast <- ToByteArray(Message{sender: username, text: "has left", sentAt: time.Now()})
 	}()
 
-	s.broadcast <- Message{sender: username, text: "has joined", sentAt: time.Now()}
+	s.broadcast <- ToByteArray(Message{sender: username, text: "has joined", sentAt: time.Now()})
 
 	for scanner.Scan() {
-		s.broadcast <- Message{sender: username, text: scanner.Text(), sentAt: time.Now()}
+		s.broadcast <- ToByteArray(Message{sender: username, text: scanner.Text(), sentAt: time.Now()})
 	}
 }

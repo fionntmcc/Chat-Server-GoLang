@@ -82,7 +82,7 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	scanner := bufio.NewScanner(conn)
 
-	fmt.Fprint(conn, "Enter username: ")
+	fmt.Fprintln(conn, "Enter username: ")
 	if !scanner.Scan() {
 		return
 	}

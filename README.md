@@ -28,7 +28,7 @@ It has SQLite-backed message persistence.
 
 #### Run server
 ```bash
-  go run ./cmd/chat-server <db-name.db>
+  go run ./cmd/chat-server <server-address> <db-name.db>
 ```
 
 #### Run client

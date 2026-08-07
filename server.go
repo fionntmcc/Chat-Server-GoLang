@@ -5,30 +5,49 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
 
+type Client struct {
+	conn     net.Conn
+	username string
+	room     string
+}
+
 type Server struct {
 	listener  net.Listener
-	clients   map[net.Conn]string // connection -> username
+	store     *Store
+	clients   map[net.Conn]*Client
 	mu        sync.RWMutex
-	broadcast chan []byte
-	quit      chan bool
+	broadcast chan BroadcastMsg
+	quit      chan struct{}
+}
+
+type BroadcastMsg struct {
+	room string
+	data []byte
 }
 
 func NewServer(address string) (*Server, error) {
 	listener, err := net.Listen("tcp", address)
-
 	if err != nil {
 		return nil, fmt.Errorf("failed to listen on %s: %v", address, err)
 	}
 
+	store, err := NewStore("chat.db")
+	if err != nil {
+		listener.Close()
+		return nil, fmt.Errorf("failed to open store: %v", err)
+	}
+
 	return &Server{
 		listener:  listener,
-		clients:   make(map[net.Conn]string),
-		broadcast: make(chan []byte),
-		quit:      make(chan bool),
+		store:     store,
+		clients:   make(map[net.Conn]*Client),
+		broadcast: make(chan BroadcastMsg, 64),
+		quit:      make(chan struct{}),
 	}, nil
 }
 
@@ -56,10 +75,13 @@ func (s *Server) Shutdown() {
 	close(s.quit)
 	s.listener.Close()
 
-	s.mu.RLock()
+	s.mu.Lock()
 	for conn := range s.clients {
 		conn.Close()
 	}
+	s.mu.Unlock()
+
+	s.store.Close()
 }
 
 func (s *Server) broadcastLoop() {
@@ -69,8 +91,10 @@ func (s *Server) broadcastLoop() {
 			return
 		case msg := <-s.broadcast:
 			s.mu.RLock()
-			for conn := range s.clients {
-				conn.Write(msg)
+			for _, client := range s.clients {
+				if client.room == msg.room {
+					client.conn.Write(msg.data)
+				}
 			}
 			s.mu.RUnlock()
 		}
@@ -82,26 +106,95 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	scanner := bufio.NewScanner(conn)
 
-	fmt.Fprintln(conn, "Enter username: ")
+	// Get username.
+	fmt.Fprint(conn, "Enter username: \n")
 	if !scanner.Scan() {
 		return
 	}
-	username := scanner.Text()
+	username := strings.TrimSpace(scanner.Text())
+	if username == "" {
+		fmt.Fprintln(conn, "username cannot be empty")
+		return
+	}
+
+	room := "general"
+
+	client := &Client{conn: conn, username: username, room: room}
 
 	s.mu.Lock()
-	s.clients[conn] = username
+	s.clients[conn] = client
 	s.mu.Unlock()
 
 	defer func() {
 		s.mu.Lock()
 		delete(s.clients, conn)
 		s.mu.Unlock()
-		s.broadcast <- ToByteArray(Message{sender: username, text: "has left", sentAt: time.Now()})
+		msg := Message{Username: username, Text: "has left", Room: room, CreatedAt: time.Now()}
+		s.broadcast <- BroadcastMsg{room: room, data: ToByteArray(msg)}
 	}()
 
-	s.broadcast <- ToByteArray(Message{sender: username, text: "has joined", sentAt: time.Now()})
+	// Send chat history to new client.
+	history, err := s.store.GetMessages(room, 50)
+	if err != nil {
+		log.Printf("error loading history: %v", err)
+	} else {
+		for _, m := range history {
+			conn.Write(ToByteArray(m))
+		}
+	}
 
+	// Announce join.
+	joinMsg := Message{Username: username, Text: "has joined", Room: room,
+		CreatedAt: time.Now()}
+	s.broadcast <- BroadcastMsg{room: room, data: ToByteArray(joinMsg)}
+
+	fmt.Fprintf(conn, "You are in #%s. Use /join <room> to switch rooms.\n", room)
+
+	// Message loop.
 	for scanner.Scan() {
-		s.broadcast <- ToByteArray(Message{sender: username, text: scanner.Text(), sentAt: time.Now()})
+		text := scanner.Text()
+
+		// Handle /join command.
+		if strings.HasPrefix(text, "/join") {
+			newRoom := strings.TrimSpace(strings.TrimPrefix(text, "/join "))
+			if newRoom == "" {
+				fmt.Fprintln(conn, "Usage: /join <room>")
+				continue
+			}
+
+			// Announce leaving old room.
+			leaveMsg := Message{Username: username, Text: "has left", Room: client.room, CreatedAt: time.Now()}
+			s.broadcast <- BroadcastMsg{room: client.room, data: ToByteArray(leaveMsg)}
+
+			// Switch room.
+			s.mu.Lock()
+			client.room = newRoom
+			s.mu.Unlock()
+			room = newRoom
+
+			// Send new room history.
+			history, err := s.store.GetMessages(room, 50)
+			if err != nil {
+				log.Printf("error loading history: %v", err)
+			} else {
+				for _, m := range history {
+					conn.Write(ToByteArray(m))
+				}
+			}
+
+			// Announce joining new room.
+			joinMsg := Message{Username: username, Text: "has joined", Room: room,
+				CreatedAt: time.Now()}
+			s.broadcast <- BroadcastMsg{room: room, data: ToByteArray(joinMsg)}
+			fmt.Fprintf(conn, "Switched to #%s\n", room)
+			continue
+		} else {
+			// Regular message — persist and broadcast.
+			msg := Message{Username: username, Text: text, Room: room, CreatedAt: time.Now()}
+			if _, err := s.store.SaveMessage(room, username, text); err != nil {
+				log.Printf("error saving message: %v", err)
+			}
+			s.broadcast <- BroadcastMsg{room: room, data: ToByteArray(msg)}
+		}
 	}
 }

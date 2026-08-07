@@ -11,9 +11,10 @@ import chat "github.com/fionntmcc/chat-Server-GoLang"
 
 func main() {
 	addr := flag.String("addr", ":8080", "server listen address")
+	dbPath := flag.String("db", "chat.db", "database file path")
 	flag.Parse()
 
-	server, err := chat.NewServer(*addr)
+	server, err := chat.NewServer(*addr, *dbPath)
 
 	if err != nil {
 		log.Fatal(err)

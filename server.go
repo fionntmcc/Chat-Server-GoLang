@@ -30,13 +30,13 @@ type BroadcastMsg struct {
 	data []byte
 }
 
-func NewServer(address string) (*Server, error) {
+func NewServer(address string, dbPath string) (*Server, error) {
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		return nil, fmt.Errorf("failed to listen on %s: %v", address, err)
 	}
 
-	store, err := NewStore("chat.db")
+	store, err := NewStore(dbPath)
 	if err != nil {
 		listener.Close()
 		return nil, fmt.Errorf("failed to open store: %v", err)

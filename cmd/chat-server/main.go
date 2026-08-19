@@ -6,8 +6,9 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+
+	"github.com/fionntmcc/chat-server/internal/chat"
 )
-import chat "github.com/fionntmcc/chat-Server-GoLang"
 
 func main() {
 	addr := flag.String("addr", ":8080", "server listen address")

@@ -1,4 +1,4 @@
-module github.com/fionntmcc/chat-Server-GoLang
+module github.com/fionntmcc/chat-server
 
 go 1.25.0
 

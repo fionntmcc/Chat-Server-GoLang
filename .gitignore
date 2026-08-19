@@ -1,0 +1,6 @@
+*.db
+*.db-wal
+*.db-shm
+coverage.out
+/bin/
+.idea/

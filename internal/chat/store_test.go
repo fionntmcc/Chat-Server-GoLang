@@ -1,6 +1,7 @@
 package chat
 
 import (
+	"sync"
 	"testing"
 )
 
@@ -161,5 +162,59 @@ func TestGetMessages_ClosedDB(t *testing.T) {
 	_, err = store.GetMessages("general", 10)
 	if err == nil {
 		t.Fatal("expected error on closed db")
+	}
+}
+
+func TestGetMessages_ConcurrentInMemory(t *testing.T) {
+	store, err := NewStore(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	const goroutines = 16
+
+	// start is a "starting gun": every goroutine blocks on it so that all 16
+	// queries overlap. Without it, a goroutine can finish and hand its
+	// connection back to the idle pool before the next one asks for one, so the
+	// pool never grows past a single connection and the defect never reproduces.
+	// close() is used rather than sending 16 values because closing wakes every
+	// blocked receiver at once, whereas each send wakes exactly one.
+	start := make(chan struct{})
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var failures int
+	var firstErr error
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1) // before `go`, so Wait cannot observe a zero counter
+		go func() {
+			defer wg.Done() // deferred, so an early return still decrements
+
+			<-start // nothing received here so all goroutines block here.
+
+			if _, err := store.GetMessages("general", 10); err != nil {
+				// t.Errorf would be safe from a goroutine (t.Fatalf would not),
+				// but counting yields one clear message instead of 14 near
+				// identical lines.
+				mu.Lock()
+				failures++
+				if firstErr == nil {
+					firstErr = err
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+
+	close(start) // closing start causes wg to start
+	wg.Wait() // all goroutines wait
+
+	// Assert on behaviour, not mechanism: this must hold whether the fix is
+	// SetMaxOpenConns(1) or the file::memory:?cache=shared DSN.
+	if failures != 0 {
+		t.Errorf("%d of %d concurrent GetMessages calls failed; first error: %v",
+			failures, goroutines, firstErr)
 	}
 }

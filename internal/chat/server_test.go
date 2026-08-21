@@ -10,7 +10,7 @@ import (
 
 func TestClientConnectAndJoin(t *testing.T) {
 	server := newTestServer(t)
-	addr := Addr(server)
+	addr := server.Addr()
 
 	conn := dial(t, addr)
 	conn.login("fionn")
@@ -20,7 +20,7 @@ func TestClientConnectAndJoin(t *testing.T) {
 
 func TestBroadcastBetweenClients(t *testing.T) {
 	server := newTestServer(t)
-	addr := Addr(server)
+	addr := server.Addr()
 
 	conn1 := dial(t, addr)
 	conn1.login("fionn")
@@ -44,7 +44,7 @@ func TestBroadcastBetweenClients(t *testing.T) {
 
 func TestCreateNewRoom(t *testing.T) {
 	server := newTestServer(t)
-	addr := Addr(server)
+	addr := server.Addr()
 
 	conn1 := dial(t, addr)
 	conn1.login("fionn")
@@ -59,7 +59,7 @@ func TestCreateNewRoom(t *testing.T) {
 	// liv sees left message, fionn sees joined message
 	conn2.expectLine(defaultTimeout, contains("fionn: has left"))
 	conn1.expectLine(defaultTimeout, contains("fionn: has joined"))
-	conn2.expectNoLine(defaultTimeout, contains("fionn: message1"))
+	conn2.expectNoLine(noLineWindow, contains("fionn: message1"))
 
 	// liv joins different room
 	conn2.send("/join different")
@@ -67,7 +67,7 @@ func TestCreateNewRoom(t *testing.T) {
 
 	// liv sees joins message, fionn does not see a message
 	conn2.expectLine(defaultTimeout, contains("liv: has joined"))
-	conn1.expectNoLine(defaultTimeout, contains("liv: message2"))
+	conn1.expectNoLine(noLineWindow, contains("liv: message2"))
 
 	// liv joins different room
 	conn2.send("/join testing")
@@ -101,7 +101,7 @@ func TestSlowClientDoesNotBlockOthers(t *testing.T) {
 	)
 
 	server := newTestServer(t)
-	addr := Addr(server)
+	addr := server.Addr()
 
 	// filler produces the traffic. It is a normal client so that its own copy of
 	// every message can be discarded, keeping it from becoming a second slow
@@ -175,6 +175,39 @@ func TestSlowClientDoesNotBlockOthers(t *testing.T) {
 	observer.expectLine(time.Second, contains("canary"))
 }
 
+// TestWhoAndRooms exercises the read side of the hub: handleConn cannot inspect
+// room membership directly, so both commands go through request/reply.
+func TestWhoAndRooms(t *testing.T) {
+	server := newTestServer(t)
+	addr := server.Addr()
+
+	fionn := dial(t, addr)
+	fionn.login("fionn")
+
+	liv := dial(t, addr)
+	liv.login("liv")
+
+	fionn.send("/who")
+	fionn.expectLine(defaultTimeout, both(contains("#general (2)"), contains("fionn, liv")))
+
+	fionn.send("/rooms")
+	fionn.expectLine(defaultTimeout, both(contains("rooms (1)"), contains("general")))
+
+	// Waiting for liv's confirmation orders the switch ahead of the next query.
+	liv.send("/join testing")
+	liv.expectLine(defaultTimeout, contains("Switched to #testing"))
+
+	fionn.send("/who")
+	fionn.expectLine(defaultTimeout, both(contains("#general (1)"), contains("fionn")))
+
+	fionn.send("/rooms")
+	fionn.expectLine(defaultTimeout, both(contains("rooms (2)"), contains("general, testing")))
+
+	// Prefix dispatch would have matched this against /who.
+	fionn.send("/whoever")
+	fionn.expectLine(defaultTimeout, chatLine("fionn", "/whoever"))
+}
+
 func TestMessagesUnderLoad(t *testing.T) {
 	const (
 		clients   = 50
@@ -183,7 +216,7 @@ func TestMessagesUnderLoad(t *testing.T) {
 	total := clients * perClient
 
 	server := newTestServer(t)
-	addr := Addr(server)
+	addr := server.Addr()
 
 	conns := make([]*testClient, 0, clients)
 	for i := 0; i < clients; i++ {

@@ -13,6 +13,11 @@ import (
 // that a genuine failure does not stall the suite.
 const defaultTimeout = 2 * time.Second
 
+// noLineWindow is the timeout for negative assertions. expectNoLine always burns
+// its whole window — there is no early exit from proving a negative — so using
+// defaultTimeout here costs 2 seconds per call for no benefit.
+const noLineWindow = 150 * time.Millisecond
+
 // testClient is a chat client for use in tests. A background goroutine reads
 // from the connection and pumps each line into c.lines, which decouples message
 // arrival from assertion: lines queue up whether or not a test is currently
@@ -196,13 +201,6 @@ func chatLine(user, text string) func(string) bool {
 	return both(contains(user+": "), contains(text))
 }
 
-// --- subtask 1.2 ------------------------------------------------------------
-//
-// newTestServer(t) belongs in this file too: start a server on 127.0.0.1:0 with
-// an in-memory store, register Shutdown via t.Cleanup, and return it alongside
-// its address. That step also adds an exported Addr() method to Server so tests
-// stop reaching into the unexported s.listener field.
-
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
 
@@ -215,10 +213,6 @@ func newTestServer(t *testing.T) *Server {
 	t.Cleanup(s.Shutdown)
 
 	return s
-}
-
-func Addr(s *Server) string {
-	return s.listener.Addr().String()
 }
 
 // collect consumes lines until n of them satisfy match, returning those n in

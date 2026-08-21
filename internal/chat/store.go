@@ -18,6 +18,23 @@ func NewStore(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
 
+	// Pin the pool to a single connection.
+	//
+	// sql.DB is a pool, and a ":memory:" database is private to the connection
+	// that opened it. With more than one connection, migrate() creates the schema
+	// on whichever one the pool hands it and queries on any other fail with
+	// "no such table: messages". Measured on this code: 15 of 16 concurrent
+	// GetMessages calls failed with the default pool, 0 with one connection.
+	//
+	// A file-backed database hides the symptom, because the schema is visible to
+	// every connection — but SQLite still permits only one writer at a time, so
+	// serialising here is defensible for both. Queries are indexed lookups of at
+	// most historyLimit rows, so the throughput cost is negligible.
+	//
+	// This is the stopgap from spec 1.2a. The full production pool decision,
+	// including whether to split read and write pools, belongs to 4.4.
+	db.SetMaxOpenConns(1)
+
 	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("set WAL mode: %w", err)

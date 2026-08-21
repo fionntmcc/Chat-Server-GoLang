@@ -6,100 +6,54 @@ import (
 	"log"
 	"net"
 	"strings"
-	"sync"
 	"time"
 )
 
 const (
+	// defaultRoom is where every client lands on connecting.
+	defaultRoom = "general"
+
 	// outboundBuffer is how many messages a client may fall behind by before it
 	// is disconnected. This is the backpressure budget: large enough to absorb a
 	// brief stall, small enough that a dead-but-open connection cannot consume
 	// unbounded memory.
 	outboundBuffer = 64
 
+	// broadcastBuffer is how many messages may be queued for the hub before
+	// senders start waiting on it.
+	broadcastBuffer = 64
+
 	// historyLimit is how many past messages a client receives on joining a room.
 	historyLimit = 50
 )
 
-type Client struct {
-	conn      net.Conn
-	username  string
-	room      string
-	out       chan []byte // buffered
-	done      chan struct{}
-	closeOnce sync.Once
+func presence(username, room, what string) []byte {
+	return ToByteArray(Message{Username: username, Text: what, Room: room, CreatedAt: time.Now()})
 }
 
-// queue hands b to writeLoop. It never blocks: if the outbound buffer is full,
-// the client is disconnected rather than allowed to stall the caller. That is
-// the same policy broadcastLoop applies, and it is the whole point of 2.1 — no
-// code path may block on a slow socket.
-func (c *Client) queue(b []byte) {
-	select {
-	case c.out <- b:
-	default:
-		c.kick("outbound buffer full")
+// signal reports completion by closing rather than sending. close cannot block;
+// a send would wedge the hub permanently if the waiting goroutine had given up.
+// The hub must never block on anything a client controls.
+func signal(reply chan struct{}) {
+	if reply != nil {
+		close(reply)
 	}
 }
 
-// queuef is queue for server-generated notices addressed to one client.
-func (c *Client) queuef(format string, args ...any) {
-	c.queue([]byte(fmt.Sprintf(format, args...)))
-}
-
-func (c *Client) writeLoop() {
-	defer c.conn.Close()
-
-	for {
-		select {
-		case <-c.done:
-			return
-		case b, ok := <-c.out:
-			if !ok {
-				return
-			}
-			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if _, err := c.conn.Write(b); err != nil {
-				return
-			}
-		}
+// answer delivers a result. reply must be buffered so this cannot block either.
+func answer(reply chan error, err error) {
+	if reply != nil {
+		reply <- err
 	}
 }
 
-// kick disconnects the client immediately, abandoning anything still queued.
-// Use it when the queue itself is the problem.
-func (c *Client) kick(reason string) {
-	c.closeOnce.Do(func() {
-		log.Printf("disconnecting %s: %s", c.username, reason)
-		close(c.done)
-		c.conn.Close()
-	})
-}
-
-// closeGracefully lets writeLoop drain whatever is queued before closing the
-// connection. Use it for validation errors and normal disconnects, where the
-// last message the client receives is the one that explains what happened.
-//
-// It shares closeOnce with kick, so whichever runs first wins and neither can
-// close a channel twice.
-func (c *Client) closeGracefully() {
-	c.closeOnce.Do(func() {
-		close(c.out)
-	})
-}
+// --- server -----------------------------------------------------------------
 
 type Server struct {
-	listener  net.Listener
-	store     *Store
-	clients   map[net.Conn]*Client
-	mu        sync.RWMutex
-	broadcast chan BroadcastMsg
-	quit      chan struct{}
-}
-
-type BroadcastMsg struct {
-	room string
-	data []byte
+	listener net.Listener
+	store    *Store
+	hub      *hub
+	quit     chan struct{}
 }
 
 func NewServer(address string, dbPath string) (*Server, error) {
@@ -114,17 +68,24 @@ func NewServer(address string, dbPath string) (*Server, error) {
 		return nil, fmt.Errorf("failed to open store: %v", err)
 	}
 
+	quit := make(chan struct{})
+
 	return &Server{
-		listener:  listener,
-		store:     store,
-		clients:   make(map[net.Conn]*Client),
-		broadcast: make(chan BroadcastMsg, 64),
-		quit:      make(chan struct{}),
+		listener: listener,
+		store:    store,
+		hub:      newHub(quit),
+		quit:     quit,
 	}, nil
 }
 
+// Addr returns the address the listener is bound to. Tests bind to port 0 and
+// need the port the OS actually assigned.
+func (s *Server) Addr() string {
+	return s.listener.Addr().String()
+}
+
 func (s *Server) Start() {
-	go s.broadcastLoop()
+	go s.hub.run()
 
 	log.Printf("server listening on %s", s.listener.Addr())
 
@@ -144,58 +105,96 @@ func (s *Server) Start() {
 }
 
 func (s *Server) Shutdown() {
+	// Closing quit stops the accept loop, stops the hub, and releases any
+	// handleConn goroutine blocked sending to it. The hub disconnects the clients
+	// it owns as it exits.
 	close(s.quit)
 	s.listener.Close()
-
-	s.mu.Lock()
-	for conn := range s.clients {
-		conn.Close()
-	}
-	s.mu.Unlock()
-
 	s.store.Close()
 }
 
-func (s *Server) broadcastLoop() {
-	for {
-		select {
-		case <-s.quit:
-			return
-		case msg := <-s.broadcast:
-			var slow []*Client
-
-			s.mu.RLock()
-
-			for _, client := range s.clients {
-				if client.room != msg.room {
-					continue
-				}
-				select {
-				case client.out <- msg.data:
-				default:
-					slow = append(slow, client)
-				}
-			}
-			s.mu.RUnlock()
-
-			for _, c := range slow {
-				c.kick("too slow")
-			}
-		}
+// enter registers c in room and waits for the hub to confirm, so history replay
+// and the banner cannot be processed ahead of the join.
+func (s *Server) enter(c *Client, room string) bool {
+	reply := make(chan struct{})
+	if !s.hub.send(s.hub.register, membership{client: c, room: room, reply: reply}) {
+		return false
+	}
+	select {
+	case <-reply:
+		return true
+	case <-s.quit:
+		return false
 	}
 }
 
-// announce broadcasts a presence change for c to whatever room c is in now.
-func (s *Server) announce(c *Client, what string) {
-	msg := Message{Username: c.username, Text: what, Room: c.room, CreatedAt: time.Now()}
-	s.broadcast <- BroadcastMsg{room: c.room, data: ToByteArray(msg)}
+// exit removes c from room and reports whether the hub confirmed it.
+//
+// The return value is load-bearing. c.out has two senders — the hub's deliver and
+// handleConn's queue — and closing a channel with more than one sender is only
+// safe if every other sender is known to have stopped. Confirmation from the hub
+// is that proof: the hub is single-threaded, so having answered means it is no
+// longer inside deliver for this client and c is in no room's member set.
+//
+// If confirmation does not arrive (the server is shutting down), the caller must
+// NOT close c.out. The hub kicks the clients it owns as it exits, and kick shares
+// closeOnce with closeGracefully, so teardown still happens exactly once.
+//
+// The old mutex version got this ordering for free: the write lock needed to
+// delete from s.clients could not be acquired while broadcastLoop held the read
+// lock. Swapping a lock for a channel does not preserve that guarantee — it has
+// to be re-established explicitly.
+func (s *Server) exit(c *Client, room string) bool {
+	reply := make(chan struct{})
+	if !s.hub.send(s.hub.unregister, membership{client: c, room: room, reply: reply}) {
+		return false
+	}
+	select {
+	case <-reply:
+		return true
+	case <-s.quit:
+		return false
+	}
 }
 
-// replayHistory queues the tail of c's current room to c alone.
-func (s *Server) replayHistory(c *Client) {
-	history, err := s.store.GetMessages(c.room, historyLimit)
+// move relocates c and waits for the hub to finish the whole transition.
+func (s *Server) move(c *Client, from, to string) bool {
+	reply := make(chan error, 1) // buffered: the hub must not block answering
+	if !s.hub.sendSwitch(roomChange{client: c, from: from, to: to, reply: reply}) {
+		return false
+	}
+	select {
+	case err := <-reply:
+		if err != nil {
+			c.queuef("cannot join #%s: %v\n", to, err)
+			return false
+		}
+		return true
+	case <-s.quit:
+		return false
+	}
+}
+
+// list asks the hub for a snapshot and waits for it. Returns false if the server
+// is shutting down.
+func (s *Server) list(ch chan listRequest, room string) ([]string, bool) {
+	reply := make(chan []string, 1) // buffered: the hub must not block answering
+	if !s.hub.sendList(ch, listRequest{room: room, reply: reply}) {
+		return nil, false
+	}
+	select {
+	case names := <-reply:
+		return names, true
+	case <-s.quit:
+		return nil, false
+	}
+}
+
+// replayHistory queues the tail of room to c alone.
+func (s *Server) replayHistory(c *Client, room string) {
+	history, err := s.store.GetMessages(room, historyLimit)
 	if err != nil {
-		log.Printf("error loading history for #%s: %v", c.room, err)
+		log.Printf("error loading history for #%s: %v", room, err)
 		return
 	}
 	for _, m := range history {
@@ -207,11 +206,9 @@ func (s *Server) handleConn(conn net.Conn) {
 	// The client exists as soon as the socket does. out and done are meaningful
 	// before any identity is known, so writeLoop starts immediately and every
 	// byte the server sends — prompts and handshake errors included — travels
-	// through out. That gives conn exactly one writer, which is the invariant
-	// 2.1 exists to establish.
+	// through out. That gives conn exactly one writer.
 	client := &Client{
 		conn: conn,
-		room: "general",
 		out:  make(chan []byte, outboundBuffer),
 		done: make(chan struct{}),
 	}
@@ -230,65 +227,104 @@ func (s *Server) handleConn(conn net.Conn) {
 	username := strings.TrimSpace(scanner.Text())
 	if username == "" {
 		client.queuef("username cannot be empty\n")
-		// Graceful, not kick: the client must actually receive the reason. A
-		// bare conn.Close() here would discard the queued message.
+		// Graceful, not kick: the client must actually receive the reason. A bare
+		// conn.Close() here would discard the queued message.
 		client.closeGracefully()
 		return
 	}
 	client.username = username
 
+	// room is this goroutine's own copy. It is never shared, so there is nothing
+	// to synchronise; the hub's map is the source of truth for delivery.
+	room := defaultRoom
+
+	// The banner is queued before registration so that it is the first line a
+	// client sees after the prompt. That matters to more than aesthetics: the
+	// test harness treats the banner as the "registration complete" signal, and
+	// anything queued ahead of it would be consumed while waiting for it.
+	client.queuef("You are in #%s. Use /join <room> to switch rooms.\n", room)
+
 	// --- registration: from here the client is reachable by broadcasts ---
 
-	s.mu.Lock()
-	s.clients[conn] = client
-	s.mu.Unlock()
+	if !s.enter(client, room) {
+		client.closeGracefully()
+		return
+	}
 
 	defer func() {
-		// Deregister before closing out. delete takes the write lock, which
-		// cannot be acquired while broadcastLoop holds the read lock, so by the
-		// time this returns no broadcast can still hold a reference to this
-		// client — which is what stops close(c.out) racing with a send on it.
-		s.mu.Lock()
-		delete(s.clients, conn)
-		s.mu.Unlock()
-
-		s.announce(client, "has left")
-		client.closeGracefully()
+		// room is read from the enclosing scope, so this sees the current room
+		// even after a /join.
+		if s.exit(client, room) {
+			// Confirmed removal: the hub will not send again, and this goroutine
+			// is the only other sender, so closing out is safe and lets writeLoop
+			// flush whatever is still queued.
+			client.closeGracefully()
+		}
+		// Otherwise the server is shutting down and the hub kicks its clients as
+		// it exits. Closing out here would race with an in-flight deliver.
 	}()
 
-	s.replayHistory(client)
-	s.announce(client, "has joined")
-	client.queuef("You are in #%s. Use /join <room> to switch rooms.\n", client.room)
+	// History comes after registration, not before, so a message sent by someone
+	// else during replay is queued behind the backlog rather than lost.
+	s.replayHistory(client, room)
 
 	// --- message loop ---
 
 	for scanner.Scan() {
 		text := scanner.Text()
 
-		if strings.HasPrefix(text, "/join") {
-			newRoom := strings.TrimSpace(strings.TrimPrefix(text, "/join "))
-			if newRoom == "" {
+		// Dispatch on the command word rather than a prefix: HasPrefix(text,
+		// "/who") also matches "/whoever". Phase 7.2 replaces this switch with a
+		// map[string]handlerFunc; it is already close to the size that justifies
+		// the change.
+		command, arg, _ := strings.Cut(text, " ")
+		arg = strings.TrimSpace(arg)
+
+		switch command {
+		case "/join":
+			if arg == "" {
 				client.queuef("Usage: /join <room>\n")
 				continue
 			}
+			if arg == room {
+				client.queuef("You are already in #%s\n", room)
+				continue
+			}
 
-			s.announce(client, "has left")
+			// The hub emits both presence announcements as part of the move.
+			if !s.move(client, room, arg) {
+				return
+			}
+			room = arg
 
-			s.mu.Lock()
-			client.room = newRoom
-			s.mu.Unlock()
+			s.replayHistory(client, room)
+			client.queuef("Switched to #%s\n", room)
+			continue
 
-			s.replayHistory(client)
-			s.announce(client, "has joined")
-			client.queuef("Switched to #%s\n", newRoom)
+		case "/who":
+			names, ok := s.list(s.hub.who, room)
+			if !ok {
+				return
+			}
+			client.queuef("#%s (%d): %s\n", room, len(names), strings.Join(names, ", "))
+			continue
+
+		case "/rooms":
+			names, ok := s.list(s.hub.rooms, "")
+			if !ok {
+				return
+			}
+			client.queuef("rooms (%d): %s\n", len(names), strings.Join(names, ", "))
 			continue
 		}
 
-		// Regular message — persist and broadcast.
-		msg := Message{Username: username, Text: text, Room: client.room, CreatedAt: time.Now()}
-		if _, err := s.store.SaveMessage(client.room, username, text); err != nil {
+		// Regular message — persist, then broadcast.
+		if _, err := s.store.SaveMessage(room, username, text); err != nil {
 			log.Printf("error saving message: %v", err)
 		}
-		s.broadcast <- BroadcastMsg{room: client.room, data: ToByteArray(msg)}
+		msg := Message{Username: username, Text: text, Room: room, CreatedAt: time.Now()}
+		if !s.hub.sendBroadcast(envelope{room: room, data: ToByteArray(msg)}) {
+			return
+		}
 	}
 }

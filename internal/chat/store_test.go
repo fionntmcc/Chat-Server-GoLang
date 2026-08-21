@@ -209,7 +209,7 @@ func TestGetMessages_ConcurrentInMemory(t *testing.T) {
 	}
 
 	close(start) // closing start causes wg to start
-	wg.Wait() // all goroutines wait
+	wg.Wait()    // all goroutines wait
 
 	// Assert on behaviour, not mechanism: this must hold whether the fix is
 	// SetMaxOpenConns(1) or the file::memory:?cache=shared DSN.

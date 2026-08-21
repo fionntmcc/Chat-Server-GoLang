@@ -221,17 +221,57 @@ func Addr(s *Server) string {
 	return s.listener.Addr().String()
 }
 
-// expectCount consumes lines until n of them satisfy match, and returns those n
-// in arrival order. It fails the test if the timeout elapses or the connection
-// closes first.
+// collect consumes lines until n of them satisfy match, returning those n in
+// arrival order. On timeout or disconnect it returns what it found plus an error
+// describing where it stopped.
 //
-// Semantics are "at least n": it returns as soon as the nth match arrives and
-// says nothing about an (n+1)th. To assert exactly n, follow it with
-// expectNoLine over a short window.
+// It never touches c.t, which is what makes it safe to call from a spawned
+// goroutine. t.Fatalf and t.FailNow must run on the test's own goroutine; called
+// elsewhere they trigger runtime.Goexit in the wrong place and Go reports
+// "test executed panic(nil) or runtime.Goexit" instead of a useful failure.
 //
 // One deadline covers the whole call. Calling expectLine n times in a loop would
 // instead permit n * timeout in the worst case — over half an hour for the 1000
 // messages per client that the fan-out test in 1.4 expects.
+func (c *testClient) collect(n int, timeout time.Duration, match func(string) bool) ([]string, error) {
+	deadline := time.After(timeout)
+	matched := make([]string, 0, n)
+
+	skipped := 0
+	var recent []string // tail of non-matching lines, for the error message
+
+	for len(matched) < n {
+		select {
+		case line, ok := <-c.lines:
+			if !ok {
+				return matched, fmt.Errorf("connection closed after %d of %d matches; last non-matching: %q",
+					len(matched), n, recent)
+			}
+			if match(line) {
+				matched = append(matched, line)
+				continue
+			}
+			// Keep only the tail: a 1000-line dump is unreadable, and the most
+			// recent lines are the informative ones.
+			skipped++
+			recent = append(recent, line)
+			if len(recent) > 5 {
+				recent = recent[1:]
+			}
+		case <-deadline:
+			return matched, fmt.Errorf("timeout after %s with %d of %d matches (%d non-matching, last: %q)",
+				timeout, len(matched), n, skipped, recent)
+		}
+	}
+
+	return matched, nil
+}
+
+// expectCount is collect with failure reporting, for use on the test goroutine.
+//
+// Semantics are "at least n": it returns as soon as the nth match arrives and
+// says nothing about an (n+1)th. To assert exactly n, follow it with
+// expectNoLine over a short window.
 func (c *testClient) expectCount(n int, timeout time.Duration, match func(string) bool) []string {
 	c.t.Helper()
 
@@ -240,37 +280,10 @@ func (c *testClient) expectCount(n int, timeout time.Duration, match func(string
 		return nil
 	}
 
-	deadline := time.After(timeout)
-	matched := make([]string, 0, n)
-
-	skipped := 0
-	var recent []string // tail of non-matching lines, for the failure message
-
-	for len(matched) < n {
-		select {
-		case line, ok := <-c.lines:
-			if !ok {
-				c.t.Fatalf("connection closed after %d of %d matches; last non-matching: %q",
-					len(matched), n, recent)
-				return nil
-			}
-			if match(line) {
-				matched = append(matched, line)
-				continue
-			}
-			// Keep only the tail: a 1000-line dump in a failure message is
-			// unreadable, and the most recent lines are the informative ones.
-			skipped++
-			recent = append(recent, line)
-			if len(recent) > 5 {
-				recent = recent[1:]
-			}
-		case <-deadline:
-			c.t.Fatalf("timeout after %s with %d of %d matches (%d non-matching, last: %q)",
-				timeout, len(matched), n, skipped, recent)
-			return nil
-		}
+	matched, err := c.collect(n, timeout, match)
+	if err != nil {
+		c.t.Fatal(err)
+		return nil
 	}
-
 	return matched
 }

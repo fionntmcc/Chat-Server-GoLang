@@ -10,10 +10,82 @@ import (
 	"time"
 )
 
+const (
+	// outboundBuffer is how many messages a client may fall behind by before it
+	// is disconnected. This is the backpressure budget: large enough to absorb a
+	// brief stall, small enough that a dead-but-open connection cannot consume
+	// unbounded memory.
+	outboundBuffer = 64
+
+	// historyLimit is how many past messages a client receives on joining a room.
+	historyLimit = 50
+)
+
 type Client struct {
-	conn     net.Conn
-	username string
-	room     string
+	conn      net.Conn
+	username  string
+	room      string
+	out       chan []byte // buffered
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+// queue hands b to writeLoop. It never blocks: if the outbound buffer is full,
+// the client is disconnected rather than allowed to stall the caller. That is
+// the same policy broadcastLoop applies, and it is the whole point of 2.1 — no
+// code path may block on a slow socket.
+func (c *Client) queue(b []byte) {
+	select {
+	case c.out <- b:
+	default:
+		c.kick("outbound buffer full")
+	}
+}
+
+// queuef is queue for server-generated notices addressed to one client.
+func (c *Client) queuef(format string, args ...any) {
+	c.queue([]byte(fmt.Sprintf(format, args...)))
+}
+
+func (c *Client) writeLoop() {
+	defer c.conn.Close()
+
+	for {
+		select {
+		case <-c.done:
+			return
+		case b, ok := <-c.out:
+			if !ok {
+				return
+			}
+			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if _, err := c.conn.Write(b); err != nil {
+				return
+			}
+		}
+	}
+}
+
+// kick disconnects the client immediately, abandoning anything still queued.
+// Use it when the queue itself is the problem.
+func (c *Client) kick(reason string) {
+	c.closeOnce.Do(func() {
+		log.Printf("disconnecting %s: %s", c.username, reason)
+		close(c.done)
+		c.conn.Close()
+	})
+}
+
+// closeGracefully lets writeLoop drain whatever is queued before closing the
+// connection. Use it for validation errors and normal disconnects, where the
+// last message the client receives is the one that explains what happened.
+//
+// It shares closeOnce with kick, so whichever runs first wins and neither can
+// close a channel twice.
+func (c *Client) closeGracefully() {
+	c.closeOnce.Do(func() {
+		close(c.out)
+	})
 }
 
 type Server struct {
@@ -90,111 +162,133 @@ func (s *Server) broadcastLoop() {
 		case <-s.quit:
 			return
 		case msg := <-s.broadcast:
+			var slow []*Client
+
 			s.mu.RLock()
+
 			for _, client := range s.clients {
-				if client.room == msg.room {
-					client.conn.Write(msg.data)
+				if client.room != msg.room {
+					continue
+				}
+				select {
+				case client.out <- msg.data:
+				default:
+					slow = append(slow, client)
 				}
 			}
 			s.mu.RUnlock()
+
+			for _, c := range slow {
+				c.kick("too slow")
+			}
 		}
 	}
 }
 
+// announce broadcasts a presence change for c to whatever room c is in now.
+func (s *Server) announce(c *Client, what string) {
+	msg := Message{Username: c.username, Text: what, Room: c.room, CreatedAt: time.Now()}
+	s.broadcast <- BroadcastMsg{room: c.room, data: ToByteArray(msg)}
+}
+
+// replayHistory queues the tail of c's current room to c alone.
+func (s *Server) replayHistory(c *Client) {
+	history, err := s.store.GetMessages(c.room, historyLimit)
+	if err != nil {
+		log.Printf("error loading history for #%s: %v", c.room, err)
+		return
+	}
+	for _, m := range history {
+		c.queue(ToByteArray(m))
+	}
+}
+
 func (s *Server) handleConn(conn net.Conn) {
-	defer conn.Close()
+	// The client exists as soon as the socket does. out and done are meaningful
+	// before any identity is known, so writeLoop starts immediately and every
+	// byte the server sends — prompts and handshake errors included — travels
+	// through out. That gives conn exactly one writer, which is the invariant
+	// 2.1 exists to establish.
+	client := &Client{
+		conn: conn,
+		room: "general",
+		out:  make(chan []byte, outboundBuffer),
+		done: make(chan struct{}),
+	}
+	go client.writeLoop()
 
 	scanner := bufio.NewScanner(conn)
 
-	// Get username.
-	fmt.Fprint(conn, "Enter username: \n")
+	// --- handshake: constructed but not yet registered ---
+
+	client.queuef("Enter username: \n")
 	if !scanner.Scan() {
+		client.closeGracefully()
 		return
 	}
+
 	username := strings.TrimSpace(scanner.Text())
 	if username == "" {
-		fmt.Fprintln(conn, "username cannot be empty")
+		client.queuef("username cannot be empty\n")
+		// Graceful, not kick: the client must actually receive the reason. A
+		// bare conn.Close() here would discard the queued message.
+		client.closeGracefully()
 		return
 	}
+	client.username = username
 
-	room := "general"
-
-	client := &Client{conn: conn, username: username, room: room}
+	// --- registration: from here the client is reachable by broadcasts ---
 
 	s.mu.Lock()
 	s.clients[conn] = client
 	s.mu.Unlock()
 
 	defer func() {
+		// Deregister before closing out. delete takes the write lock, which
+		// cannot be acquired while broadcastLoop holds the read lock, so by the
+		// time this returns no broadcast can still hold a reference to this
+		// client — which is what stops close(c.out) racing with a send on it.
 		s.mu.Lock()
 		delete(s.clients, conn)
 		s.mu.Unlock()
-		msg := Message{Username: username, Text: "has left", Room: room, CreatedAt: time.Now()}
-		s.broadcast <- BroadcastMsg{room: room, data: ToByteArray(msg)}
+
+		s.announce(client, "has left")
+		client.closeGracefully()
 	}()
 
-	// Send chat history to new client.
-	history, err := s.store.GetMessages(room, 50)
-	if err != nil {
-		log.Printf("error loading history: %v", err)
-	} else {
-		for _, m := range history {
-			conn.Write(ToByteArray(m))
-		}
-	}
+	s.replayHistory(client)
+	s.announce(client, "has joined")
+	client.queuef("You are in #%s. Use /join <room> to switch rooms.\n", client.room)
 
-	// Announce join.
-	joinMsg := Message{Username: username, Text: "has joined", Room: room,
-		CreatedAt: time.Now()}
-	s.broadcast <- BroadcastMsg{room: room, data: ToByteArray(joinMsg)}
+	// --- message loop ---
 
-	fmt.Fprintf(conn, "You are in #%s. Use /join <room> to switch rooms.\n", room)
-
-	// Message loop.
 	for scanner.Scan() {
 		text := scanner.Text()
 
-		// Handle /join command.
 		if strings.HasPrefix(text, "/join") {
 			newRoom := strings.TrimSpace(strings.TrimPrefix(text, "/join "))
 			if newRoom == "" {
-				fmt.Fprintln(conn, "Usage: /join <room>")
+				client.queuef("Usage: /join <room>\n")
 				continue
 			}
 
-			// Announce leaving old room.
-			leaveMsg := Message{Username: username, Text: "has left", Room: client.room, CreatedAt: time.Now()}
-			s.broadcast <- BroadcastMsg{room: client.room, data: ToByteArray(leaveMsg)}
+			s.announce(client, "has left")
 
-			// Switch room.
 			s.mu.Lock()
 			client.room = newRoom
 			s.mu.Unlock()
-			room = newRoom
 
-			// Send new room history.
-			history, err := s.store.GetMessages(room, 50)
-			if err != nil {
-				log.Printf("error loading history: %v", err)
-			} else {
-				for _, m := range history {
-					conn.Write(ToByteArray(m))
-				}
-			}
-
-			// Announce joining new room.
-			joinMsg := Message{Username: username, Text: "has joined", Room: room,
-				CreatedAt: time.Now()}
-			s.broadcast <- BroadcastMsg{room: room, data: ToByteArray(joinMsg)}
-			fmt.Fprintf(conn, "Switched to #%s\n", room)
+			s.replayHistory(client)
+			s.announce(client, "has joined")
+			client.queuef("Switched to #%s\n", newRoom)
 			continue
-		} else {
-			// Regular message — persist and broadcast.
-			msg := Message{Username: username, Text: text, Room: room, CreatedAt: time.Now()}
-			if _, err := s.store.SaveMessage(room, username, text); err != nil {
-				log.Printf("error saving message: %v", err)
-			}
-			s.broadcast <- BroadcastMsg{room: room, data: ToByteArray(msg)}
 		}
+
+		// Regular message — persist and broadcast.
+		msg := Message{Username: username, Text: text, Room: client.room, CreatedAt: time.Now()}
+		if _, err := s.store.SaveMessage(client.room, username, text); err != nil {
+			log.Printf("error saving message: %v", err)
+		}
+		s.broadcast <- BroadcastMsg{room: client.room, data: ToByteArray(msg)}
 	}
 }
